@@ -293,11 +293,26 @@ This is a **local privilege escalation primitive**:
   a denial-of-service, or targeting a directory where file *creation* alone
   triggers a privileged action).
 
+**Mitigating factor — no setuid bit:**
+`/usr/lib/systemd/system-generators/sshd-socket-generator` is installed
+as `-rwxr-xr-x` (owned by root, no setuid bit).  When a non-root user
+invokes it directly it runs with **their own UID**, not root.  The
+privilege escalation path via PoC #4 therefore only exists when
+**systemd itself** triggers the generator (at boot or on
+`systemctl daemon-reload`), since systemd runs as PID 1 with root
+privileges and the generator inherits them in that context.
+
+A non-root user invoking the binary directly can still win the race and
+cause damage within their own file space, but cannot affect root-owned
+paths or escalate privileges through this vector alone.
+
 **Bottom line:** PoC #4 is a confirmed local privilege escalation primitive
-that requires chaining with at least one additional condition (ability to
-influence `sshd_config` content, or a suitable alternative target path).
-Without chaining it is a reliable local denial-of-service via file
-truncation.  The TOCTOU fix on branch `security-flaw-fixes` (using
+when triggered via systemd, requiring chaining with at least one additional
+condition (ability to influence `sshd_config` content, or a suitable
+alternative target path).  Direct invocation by a non-root user is limited
+to damage within that user's own file space.  Without chaining it is a
+reliable local denial-of-service via file truncation when run as root.
+The TOCTOU fix on branch `security-flaw-fixes` (using
 `openat(O_NOFOLLOW)`) eliminates the primitive entirely.
 
 ---

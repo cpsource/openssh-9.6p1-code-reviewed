@@ -123,9 +123,17 @@ Between the `mkdir` call and the `fopen` call, a local attacker can:
 creating or truncating the symlink target. The `e` mode flag only adds
 `O_CLOEXEC`; it provides no protection against symlink attacks.
 
-Because the generator typically runs as root (invoked by systemd), a
+The generator typically runs as root when invoked by systemd (PID 1), so a
 successful race allows an attacker to truncate or overwrite an arbitrary file
 owned by root.
+
+**Mitigating factor — no setuid bit:**
+The binary is installed as `-rwxr-xr-x` (no setuid bit).  When invoked
+directly by a non-root user it runs with that user's UID, not root.  The
+privilege escalation path therefore only exists when systemd triggers the
+generator at boot or on `systemctl daemon-reload`.  A non-root user invoking
+the binary directly can still win the race but is limited to damage within
+their own file space.
 
 **Recommendation:** Use `openat(dirfd, "addresses.conf", O_WRONLY|O_CREAT|O_TRUNC|O_NOFOLLOW|O_CLOEXEC, 0644)` with a directory fd obtained via `open(overridedir, O_DIRECTORY|O_NOFOLLOW)` to eliminate the TOCTOU window.
 
@@ -235,13 +243,24 @@ can complicate log parsing.
 
 ## Summary
 
-| # | File | Severity | Description |
-|---|------|----------|-------------|
-| 1 | sshd-socket-generator.c:136 | **HIGH** | OOB read in `path_append()` on empty base |
-| 2 | sshd.c:1054,1065 | **HIGH** | `strtonum` failure returns `-errno`; errno not set by strtonum |
-| 3 | sshd-socket-generator.c:327 | **MEDIUM** | No validation of `argv[1]` destination path — path traversal |
-| 4 | sshd-socket-generator.c:192-203 | **MEDIUM** | TOCTOU race / symlink attack between `mkdir` and `fopen` |
-| 5 | sshd-socket-generator.c:310-311 | **MEDIUM** | Return values of `load_server_config`/`parse_server_config` ignored |
-| 6 | sshd-socket-generator.c:105 | **LOW** | No explicit null terminator after `memcpy` |
-| 7 | sshd-socket-generator.c:123 | **LOW** | `listen_stream_set_len` breaks on first empty slot — fragile |
-| 8 | sshd-socket-generator.c:331,345 | **INFO** | Typos in error messages |
+| # | File | Severity | Remote? | Priv-esc? | Description |
+|---|------|----------|---------|-----------|-------------|
+| 1 | sshd-socket-generator.c:136 | **HIGH** | No | No (no setuid) | OOB read in `path_append()` on empty base |
+| 2 | sshd.c:1054,1065 | **HIGH** | No | No | `strtonum` failure returns `-errno`; errno not set by strtonum |
+| 3 | sshd-socket-generator.c:327 | **MEDIUM** | No | No (no setuid) | No validation of `argv[1]` destination path — path traversal |
+| 4 | sshd-socket-generator.c:192-203 | **MEDIUM** | No | **Yes, if via systemd** | TOCTOU race / symlink attack between `mkdir` and `fopen` |
+| 5 | sshd-socket-generator.c:310-311 | **MEDIUM** | No | No | Return values of `load_server_config`/`parse_server_config` ignored (false positive — both are void) |
+| 6 | sshd-socket-generator.c:105 | **LOW** | No | No | No explicit null terminator after `memcpy` |
+| 7 | sshd-socket-generator.c:123 | **LOW** | No | No | `listen_stream_set_len` breaks on first empty slot — fragile |
+| 8 | sshd-socket-generator.c:331,345 | **INFO** | No | No | Typos in error messages |
+
+**Remote exploitability:** None of these vulnerabilities are reachable via
+port 22 or any network connection.  All affect `sshd-socket-generator` (a
+boot-time systemd utility) or a startup-only code path in `sshd.c` that
+completes before any connection is accepted.
+
+**Privilege escalation:** The binary is installed without a setuid bit
+(`-rwxr-xr-x`), so direct invocation by a non-root user runs with that
+user's own privileges.  Finding #4 (TOCTOU) is a privilege escalation
+primitive only when systemd triggers the generator as root, and requires
+chaining with write access to `sshd_config` or a suitable target path.
