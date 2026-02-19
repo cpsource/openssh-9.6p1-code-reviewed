@@ -1,0 +1,21 @@
+# sshd_config.example — Certificate-related additions for frflashy.com
+#
+# These lines go into /etc/ssh/sshd_config on the server.
+# See README-cert.md for the full setup guide.
+#
+# After running:
+#   bash ca/sign-host-key.sh /etc/ssh/ssh_host_ed25519_key.pub frflashy.com
+#   scp /tmp/ssh_host_ed25519_key-cert.pub root@frflashy.com:/etc/ssh/
+#
+# Add the HostCertificate line and reload sshd:
+#   systemctl reload ssh
+
+# --- Existing HostKey lines (unchanged) ---
+#HostKey /etc/ssh/ssh_host_rsa_key
+#HostKey /etc/ssh/ssh_host_ecdsa_key
+HostKey /etc/ssh/ssh_host_ed25519_key
+
+# --- Add this: host certificate signed by the Host CA ---
+# Eliminates the "Are you sure you want to continue connecting?" TOFU prompt
+# on any client that has ca/ssh_host_ca.pub in its known_hosts.
+HostCertificate /etc/ssh/ssh_host_ed25519_key-cert.pub

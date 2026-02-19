@@ -1,0 +1,9 @@
+# CA private key — NEVER commit this.
+# It lives on your local machine only.
+ssh_host_ca
+
+# KRL (Key Revocation List) — generated locally, deployed separately.
+*.krl
+
+# Signed certificates — these live on the server, not in the repo.
+*-cert.pub

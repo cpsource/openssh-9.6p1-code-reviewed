@@ -1,0 +1,20 @@
+# known_hosts.example — CA trust line for frflashy.com clients.
+#
+# After running ca/setup-ca.sh, deploy this trust to every machine
+# that connects to frflashy.com:
+#
+#   sudo bash -c 'printf "@cert-authority frflashy.com,*.frflashy.com "; \
+#       cat ca/ssh_host_ca.pub' >> /etc/ssh/ssh_known_hosts
+#
+# Or copy this file (with the placeholder replaced) to:
+#   /etc/ssh/ssh_known_hosts   (system-wide, preferred)
+#   ~/.ssh/known_hosts         (per-user)
+#
+# The @cert-authority marker tells SSH to trust any host certificate
+# signed by this CA for connections to frflashy.com and its subdomains.
+# No TOFU prompt will appear for any server presenting a valid certificate.
+#
+# Replace <PASTE_CONTENTS_OF_ca/ssh_host_ca.pub_HERE> with the actual
+# public key after running ca/setup-ca.sh.
+
+@cert-authority frflashy.com,*.frflashy.com <PASTE_CONTENTS_OF_ca/ssh_host_ca.pub_HERE>

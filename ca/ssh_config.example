@@ -1,0 +1,24 @@
+# ssh_config.example — Certificate-related additions for frflashy.com clients
+#
+# These lines go into /etc/ssh/ssh_known_hosts and /etc/ssh/ssh_config
+# on every machine that connects to frflashy.com.
+# See README-cert.md for the full setup guide.
+#
+# After running ca/setup-ca.sh, deploy trust to each client with:
+#   sudo bash -c 'printf "@cert-authority frflashy.com,*.frflashy.com "; \
+#       cat ca/ssh_host_ca.pub' >> /etc/ssh/ssh_known_hosts
+
+# --- /etc/ssh/ssh_known_hosts ---
+# Trust any host certificate signed by the Host CA for frflashy.com.
+# Replace <CA_PUBLIC_KEY> with the full contents of ca/ssh_host_ca.pub.
+#
+# @cert-authority frflashy.com,*.frflashy.com <CA_PUBLIC_KEY>
+
+
+# --- /etc/ssh/ssh_config (or ~/.ssh/config) ---
+# Optional: reject keys/certs listed in the KRL (from ca/revoke-host-key.sh).
+# Deploy the KRL to clients after any revocation:
+#   scp ca/revoked.krl root@clienthost:/etc/ssh/revoked_host_keys.krl
+#
+# Host frflashy.com
+#     RevokedHostKeys /etc/ssh/revoked_host_keys.krl

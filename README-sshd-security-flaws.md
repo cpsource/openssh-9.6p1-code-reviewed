@@ -1106,6 +1106,10 @@ window for any host with an SSHFP record.
 
 #### Mitigation 4: SSH host certificates (strongest — eliminates TOFU entirely)
 
+> **Full implementation guide: [`README-cert.md`](README-cert.md)**
+> CA management scripts are in the [`ca/`](ca/) directory.
+
+
 OpenSSH supports CA-signed host certificates.  The server presents a
 certificate signed by a trusted CA; the client trusts the CA rather than
 individual host keys.  This eliminates the TOFU window, enables instant
