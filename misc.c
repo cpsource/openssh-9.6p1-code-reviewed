@@ -647,7 +647,7 @@ convtime(const char *s)
 }
 
 #define TF_BUFS	8
-#define TF_LEN	9
+#define TF_LEN	27	/* "%02llu" can be up to 20 digits + "wXdYYh" + NUL */
 
 const char *
 fmt_timeframe(time_t t)

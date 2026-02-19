@@ -767,8 +767,8 @@ int main(void) { if (NSVersionOfRunTimeLibrary("System") >= (60 << 16))
 	AC_DEFINE([SSH_TUN_PREPEND_AF], [1],
 	    [Prepend the address family to IP tunnel traffic])
 	AC_MSG_CHECKING([if we have the Security Authorization Session API])
-	AC_TRY_COMPILE([#include <Security/AuthSession.h>],
-		[SessionCreate(0, 0);],
+	AC_COMPILE_IFELSE([AC_LANG_PROGRAM([#include <Security/AuthSession.h>],
+		[SessionCreate(0, 0);])],
 		[ac_cv_use_security_session_api="yes"
 		 AC_DEFINE([USE_SECURITY_SESSION_API], [1],
 			[platform has the Security Authorization Session API])
@@ -777,10 +777,10 @@ int main(void) { if (NSVersionOfRunTimeLibrary("System") >= (60 << 16))
 		[ac_cv_use_security_session_api="no"
 		 AC_MSG_RESULT([no])])
 	AC_MSG_CHECKING([if we have an in-memory credentials cache])
-	AC_TRY_COMPILE(
+	AC_COMPILE_IFELSE([AC_LANG_PROGRAM(
 		[#include <Kerberos/Kerberos.h>],
 		[cc_context_t c;
-		 (void) cc_initialize (&c, 0, NULL, NULL);],
+		 (void) cc_initialize (&c, 0, NULL, NULL);])],
 		[AC_DEFINE([USE_CCAPI], [1],
 			[platform uses an in-memory credentials cache])
 		 LIBS="$LIBS -framework Security"

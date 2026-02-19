@@ -22,6 +22,8 @@
 #include "pathnames.h"
 #include "servconf.h"
 #include "sshbuf.h"
+#include "sshkey.h"
+#include "ssherr.h"
 
 #define MAX_LISTEN_STREAMS      (16)
 #define MAX_LISTEN_STREAM_LEN   (NI_MAXHOST + NI_MAXSERV + sizeof("ListenAddress=[:]") + 1)
@@ -42,6 +44,46 @@ struct monitor *pmonitor = NULL;
 struct ssh *the_active_state = NULL;
 struct sshauthopt *auth_opts = NULL;
 struct sshbuf *loginmsg = NULL;
+
+/* Stub globals and functions required to satisfy link dependencies from
+ * monitor.o and related objects.  None of these are used by the generator. */
+typedef struct Session Session;
+struct passwd *privsep_pw = NULL;
+int auth_sock = -1;
+u_int utmp_len = 0;
+
+struct sshkey *get_hostkey_by_index(int ind) { return NULL; }
+struct sshkey *get_hostkey_public_by_index(int ind, struct ssh *ssh)
+    { return NULL; }
+struct sshkey *get_hostkey_public_by_type(int type, int nid, struct ssh *ssh)
+    { return NULL; }
+struct sshkey *get_hostkey_private_by_type(int type, int nid, struct ssh *ssh)
+    { return NULL; }
+int get_hostkey_index(struct sshkey *key, int compare, struct ssh *ssh)
+    { return -1; }
+int sshd_hostkey_sign(struct ssh *ssh, struct sshkey *privkey,
+    struct sshkey *pubkey, u_char **signature, size_t *slenp,
+    const u_char *data, size_t dlen, const char *alg)
+    { return SSH_ERR_INTERNAL_ERROR; }
+
+void session_unused(int id) {}
+Session *session_new(void) { return NULL; }
+Session *session_by_tty(char *tty) { return NULL; }
+void session_pty_cleanup2(Session *s) {}
+void session_destroy_all(struct ssh *ssh, void (*closefunc)(Session *)) {}
+const char *session_get_remote_name_or_ip(struct ssh *ssh,
+    u_int utmp_size, int use_dns) { return NULL; }
+
+int pty_allocate(int *ptyfd, int *ttyfd, char *namebuf, size_t namebuflen)
+    { return 0; }
+void pty_setowner(struct passwd *pw, const char *tty, const char *role) {}
+
+void record_login(pid_t pid, const char *tty, const char *user, uid_t uid,
+    const char *host, struct sockaddr *addr, socklen_t addrlen) {}
+
+int sshsk_sign(const char *provider, struct sshkey *key,
+    u_char **sigp, size_t *lenp, const u_char *data, size_t datalen,
+    u_int compat, const char *pin) { return SSH_ERR_INTERNAL_ERROR; }
 
 static int listen_stream_set_append(listen_stream_set set, const char *listen_stream) {
         size_t n;

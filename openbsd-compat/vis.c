@@ -216,7 +216,7 @@ strnvis(char *dst, const char *src, size_t siz, int flag)
 int
 stravis(char **outp, const char *src, int flag)
 {
-	char *buf;
+	char *buf, *tmp;
 	int len, serrno;
 
 	buf = reallocarray(NULL, 4, strlen(src) + 1);
@@ -224,10 +224,12 @@ stravis(char **outp, const char *src, int flag)
 		return -1;
 	len = strvis(buf, src, flag);
 	serrno = errno;
-	*outp = realloc(buf, len + 1);
-	if (*outp == NULL) {
+	tmp = realloc(buf, len + 1);
+	if (tmp == NULL) {
 		*outp = buf;
 		errno = serrno;
+	} else {
+		*outp = tmp;
 	}
 	return (len);
 }

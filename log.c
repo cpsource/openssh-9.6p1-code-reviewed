@@ -393,8 +393,8 @@ do_log(LogLevel level, int force, const char *suffix, const char *fmt,
 		vsnprintf(msgbuf, sizeof(msgbuf), fmt, args);
 	}
 	if (suffix != NULL) {
-		snprintf(fmtbuf, sizeof(fmtbuf), "%s: %s", msgbuf, suffix);
-		strlcpy(msgbuf, fmtbuf, sizeof(msgbuf));
+		strlcat(msgbuf, ": ", sizeof(msgbuf));
+		strlcat(msgbuf, suffix, sizeof(msgbuf));
 	}
 	strnvis(fmtbuf, msgbuf, sizeof(fmtbuf),
 	    log_on_stderr ? LOG_STDERR_VIS : LOG_SYSLOG_VIS);

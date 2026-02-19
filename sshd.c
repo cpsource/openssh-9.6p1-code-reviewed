@@ -1042,7 +1042,6 @@ get_systemd_listen_fds(void)
 	pid_t listen_pid;
 	int listen_fds;
 	const char *errstr = NULL;
-	int fd;
 
 	/* When we have been re-executed, do not check $LISTEN_PID because it will
 	 * not match, but we still need to check $LISTEN_FDS. */

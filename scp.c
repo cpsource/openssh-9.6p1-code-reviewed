@@ -1545,7 +1545,9 @@ rsource(char *name, struct stat *statp)
 			run_err("%s/%s: name too long", name, dp->d_name);
 			continue;
 		}
-		(void) snprintf(path, sizeof path, "%s/%s", name, dp->d_name);
+		(void) strlcpy(path, name, sizeof(path));
+		(void) strlcat(path, "/", sizeof(path));
+		(void) strlcat(path, dp->d_name, sizeof(path));
 		vect[0] = path;
 		source(1, vect);
 	}
