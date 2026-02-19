@@ -2,8 +2,8 @@
 
 This document records findings from a source-level security review of the
 sshd-related code in this tree, with particular focus on the new
-`sshd-socket-generator.c` file and the systemd socket-activation additions
-to `sshd.c`.
+`sshd-socket-generator.c` file, the systemd socket-activation additions
+to `sshd.c`, and the SSH2 user-authentication dispatcher in `auth2.c`.
 
 Severity ratings: **CRITICAL / HIGH / MEDIUM / LOW / INFO**
 
@@ -241,6 +241,107 @@ can complicate log parsing.
 
 ---
 
+## 9. Unsanitised `role` and `style` Substrings Passed to PAM and `setproctitle`
+
+**File:** `auth2.c:289-295, 323-326`
+**Severity:** LOW
+
+```c
+if ((role = strchr(user, '/')) != NULL)
+    *role++ = 0;
+if ((style = strchr(user, ':')) != NULL)
+    *style++ = 0;
+else if (role && (style = strchr(role, ':')) != NULL)
+    *style++ = '\0';
+...
+authctxt->style = style ? xstrdup(style) : NULL;
+authctxt->role  = role  ? xstrdup(role)  : NULL;
+if (use_privsep)
+    mm_inform_authserv(service, style, role);
+```
+
+The `user` field in an `SSH2_MSG_USERAUTH_REQUEST` packet is accepted from
+the remote client without restriction. Before the user is validated, the code
+splits it on `/` and `:` to extract optional `role` and `style` substrings.
+These substrings are stored verbatim and forwarded to:
+
+- `mm_inform_authserv()` — crosses the privilege-separation boundary into the
+  monitor process.
+- `start_pam(ssh)` — passed as the PAM service style; a crafted value could
+  influence PAM module selection on misconfigured systems.
+- `setproctitle()` (line 320) — visible in `ps` output; a crafted string
+  could inject misleading process titles.
+- `debug()` logging (line 286) — raw client bytes appear in sshd log output
+  before any validation, enabling log injection (see finding #10).
+
+No length or character-set validation is performed on `role` or `style`
+before any of these uses. The fields are bounded by the overall SSH packet
+size limit, so there is no heap overflow, but the lack of sanitisation is
+a defence-in-depth gap.
+
+**Recommendation:** Validate that `role` and `style` contain only printable,
+non-whitespace ASCII before storing or forwarding them. Reject or truncate
+values that contain control characters, newlines, or are unreasonably long.
+
+---
+
+## 10. Raw Client Strings Logged Before Validation (Log Injection)
+
+**File:** `auth2.c:286`
+**Severity:** INFO
+
+```c
+debug("userauth-request for user %s service %s method %s", user, service, method);
+```
+
+`user`, `service`, and `method` are client-supplied strings read directly
+from the SSH packet and logged verbatim before any validation. An attacker
+can embed ANSI escape sequences or newline characters to:
+
+- Forge spurious log lines (e.g. fake "Accepted publickey" entries).
+- Corrupt structured log parsers (syslog, journald, SIEM tools) that split
+  on newlines.
+- Trigger terminal emulator escape-sequence processing if an administrator
+  tails the log in a terminal.
+
+OpenSSH's `debug()` path does not sanitise control characters. The `service`
+and `method` values are subject to the same issue.
+
+**Recommendation:** Strip or escape control characters (especially `\n`,
+`\r`, and ESC) from client-supplied strings before passing them to any
+logging function.
+
+---
+
+## 11. Implicit `double` → `time_t` Cast in `ensure_minimum_time_since`
+
+**File:** `auth2.c:263-264`
+**Severity:** INFO
+
+```c
+ts.tv_sec  = remain;                              /* double → time_t, unchecked */
+ts.tv_nsec = (remain - ts.tv_sec) * 1000000000;
+```
+
+`remain` is a `double` computed as `seconds - elapsed`. The assignment to
+`ts.tv_sec` (type `time_t`, a signed integer) is an implicit narrowing
+conversion. If `remain` is negative or larger than `TIME_T_MAX`, the
+conversion has implementation-defined behaviour (C11 §6.3.1.4).
+
+The `while` loop at line 260 doubles `seconds` until `remain >= 0`, so
+`remain` should always be non-negative when `nanosleep` is called. However,
+the `MAX_FAIL_DELAY_SECONDS` early-return at line 253 means very long
+authentication methods bypass the loop entirely and go straight to the cast.
+In pathological clock conditions (e.g. `monotime_double()` returning a very
+large value due to NTP step or VM migration) `elapsed` could exceed
+`MAX_FAIL_DELAY_SECONDS` while `remain` computed later is still negative,
+leading to a large `ts.tv_sec` value.
+
+**Recommendation:** Clamp `remain` to `[0, MAX_FAIL_DELAY_SECONDS]` before
+assigning to `ts.tv_sec`, or use an explicit cast with a range check.
+
+---
+
 ## Summary
 
 | # | File | Severity | Remote? | Priv-esc? | Description |
@@ -253,14 +354,18 @@ can complicate log parsing.
 | 6 | sshd-socket-generator.c:105 | **LOW** | No | No | No explicit null terminator after `memcpy` |
 | 7 | sshd-socket-generator.c:123 | **LOW** | No | No | `listen_stream_set_len` breaks on first empty slot — fragile |
 | 8 | sshd-socket-generator.c:331,345 | **INFO** | No | No | Typos in error messages |
+| 9 | auth2.c:289-326 | **LOW** | **Yes** | No | Unsanitised `role`/`style` from client passed to PAM and `setproctitle` |
+| 10 | auth2.c:286 | **INFO** | **Yes** | No | Raw client strings logged before validation — log injection |
+| 11 | auth2.c:263-264 | **INFO** | No | No | Implicit `double`→`time_t` cast in timing delay; unchecked for out-of-range |
 
-**Remote exploitability:** None of these vulnerabilities are reachable via
-port 22 or any network connection.  All affect `sshd-socket-generator` (a
-boot-time systemd utility) or a startup-only code path in `sshd.c` that
-completes before any connection is accepted.
+**Remote exploitability:** Findings 1–8 are not reachable via port 22 —
+they affect `sshd-socket-generator` (a boot-time utility) or a startup-only
+code path in `sshd.c`.  Findings 9 and 10 are reachable by any unauthenticated
+remote client: the vulnerable code executes during SSH2 user-authentication
+packet processing, before credentials are verified.
 
-**Privilege escalation:** The binary is installed without a setuid bit
-(`-rwxr-xr-x`), so direct invocation by a non-root user runs with that
-user's own privileges.  Finding #4 (TOCTOU) is a privilege escalation
-primitive only when systemd triggers the generator as root, and requires
-chaining with write access to `sshd_config` or a suitable target path.
+**Privilege escalation:** No finding enables direct privilege escalation.
+Finding #4 (TOCTOU) is a privilege-escalation primitive only when systemd
+triggers the generator as root and requires chaining with at least one
+additional condition.  The `sshd-socket-generator` binary is installed
+without a setuid bit (`-rwxr-xr-x`).
