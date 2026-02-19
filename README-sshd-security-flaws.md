@@ -342,6 +342,153 @@ assigning to `ts.tv_sec`, or use an explicit cast with a range check.
 
 ---
 
+## 12. GSS Algorithm Lookup Uses Prefix Match (`strncmp`) Instead of Exact Match
+
+**File:** `kex.c:180-188`
+**Severity:** LOW
+
+```c
+for (k = kexalgs; k->name != NULL; k++) {
+    if (strcmp(k->name, name) == 0)              /* exact match */
+        return k;
+}
+for (k = gss_kexalgs; k->name != NULL; k++) {
+    if (strncmp(k->name, name, strlen(k->name)) == 0)   /* prefix match only */
+        return k;
+}
+```
+
+Non-GSS algorithm names are looked up with `strcmp` (exact match). GSS
+algorithm names are looked up with `strncmp(table_entry, proposed,
+strlen(table_entry))` — which matches any proposed name that *begins with* a
+known GSS table entry.  For example, a peer proposing
+`gss-gex-sha1-<OID>GARBAGE` would match the `gss-gex-sha1-<OID>` entry.
+
+The matched `kexalg` struct provides the `kex_type` used to dispatch the
+actual GSSAPI key exchange handler, while `kex->name` is set from the
+negotiated string returned by `match_list`.  In GSSAPI exchanges the
+mechanism OID is base64-decoded from the algorithm name suffix; a crafted
+suffix that extends a valid OID with extra bytes will produce a different
+(invalid) OID, likely causing the GSSAPI exchange to fail — but the
+mismatch between the lookup type and the name in `kex->name` is an
+unexpected inconsistency that could have more impactful consequences as
+the code evolves or with future GSS algorithm additions.
+
+GSSAPI support must be compiled in (`--with-kerberos5`) and enabled in
+`sshd_config` for this path to be reachable.
+
+**Recommendation:** Use `strcmp` for GSS algorithm lookup as well.  Let the
+GSSAPI layer handle OID extraction from the full, exact algorithm name.
+
+---
+
+## 13. Control Characters in SSH Version Banner Not Sanitised (Log Injection)
+
+**File:** `kex.c:1616-1654`
+**Severity:** LOW
+
+```c
+if (c == '\r') { expect_nl = 1; continue; }
+if (c == '\n') break;
+if (c == '\0' || expect_nl) {
+    verbose_f("banner line contains invalid characters");
+    goto invalid;
+}
+/* All other bytes — including ESC, \x01–\x1f — are silently accepted */
+if ((r = sshbuf_put_u8(peer_version, c)) != 0) { ... }
+```
+
+The per-character banner parser rejects only null bytes and bytes that
+follow `\r` without a `\n`.  All other control characters — including ANSI
+escape sequences (`\x1b[...`) and `\x01`–`\x1f` — are stored verbatim and
+subsequently logged:
+
+```c
+debug_f("banner line %zu: %s", n, cp);          // pre-banner lines
+debug("Remote protocol version %d.%d, remote software version %.100s",
+    remote_major, remote_minor, remote_version); // version addendum
+```
+
+This is the same log-injection class as finding #10 (`auth2.c:286`) but
+triggered even earlier — before key exchange begins — by any connecting
+client or, from the client's perspective, by any server.  An attacker can
+embed ANSI terminal codes to misrender log output in colour-capable viewers,
+or embed newlines in pre-banner lines to forge subsequent log entries.
+
+**Recommendation:** Reject or escape any byte outside `0x20`–`0x7e` (printable
+ASCII) when reading the peer version banner, in addition to the existing
+null-byte check.
+
+---
+
+## 14. `proposals_match` Permanently Mutates Proposal Strings
+
+**File:** `kex.c:1194-1197`
+**Severity:** INFO
+
+```c
+static int
+proposals_match(char *my[PROPOSAL_MAX], char *peer[PROPOSAL_MAX])
+{
+    ...
+    for (idx = &check[0]; *idx != -1; idx++) {
+        if ((p = strchr(my[*idx], ',')) != NULL)
+            *p = '\0';      /* truncates my[PROPOSAL_KEX_ALGS] in place */
+        if ((p = strchr(peer[*idx], ',')) != NULL)
+            *p = '\0';      /* truncates peer[PROPOSAL_KEX_ALGS] in place */
+        if (strcmp(my[*idx], peer[*idx]) != 0) { ... }
+    }
+}
+```
+
+To isolate the first algorithm from each name-list for comparison,
+`proposals_match` writes a null byte over the first comma in the KEX and
+host-key proposal strings.  This is a destructive, permanent modification
+of the caller's data.
+
+Currently harmless — the proposals are freed immediately after the call
+(`kex_prop_free(my)` / `kex_prop_free(peer)` at lines 1342–1343) and
+`proposals_match` is called only once per handshake.  However, if the call
+site were ever refactored to reuse or log the proposal arrays after this
+call, the truncated strings would silently produce incorrect output (e.g.
+showing only the first algorithm in diagnostics, or failing to match a
+second algorithm during re-key negotiation).
+
+**Recommendation:** Operate on a local copy, or use `strncmp` with a
+computed length (`strcspn(str, ",")`) rather than mutating the caller's
+string.
+
+---
+
+## 15. No Length Cap on `server-sig-algs` EXT_INFO Value
+
+**File:** `kex.c:745-746`
+**Severity:** INFO
+
+```c
+free(ssh->kex->server_sig_algs);
+ssh->kex->server_sig_algs = xstrdup((const char *)value);
+```
+
+The `server-sig-algs` extension value received from the server in
+`SSH2_MSG_EXT_INFO` is stored without imposing any length limit beyond the
+SSH packet size (~32 KB per packet, up to 256 MB total with `MaxPacket`).
+This string is subsequently consumed by `has_any_alg()` → `match_list()`
+every time the client evaluates algorithm preferences during authentication
+and key exchange.  `match_list` iterates over both its arguments character
+by character, so a 32 KB `server-sig-algs` string results in O(n·m) work
+per algorithm selection call.
+
+A malicious server can also send up to 1024 extension entries per
+`SSH2_MSG_EXT_INFO` message (enforced at `kex.c:800`); combined with the
+unbounded value storage, this creates a client-side CPU-exhaustion surface
+for a rogue server.
+
+**Recommendation:** Cap `server-sig-algs` at a reasonable maximum (e.g. 4 KB)
+and return `SSH_ERR_INVALID_FORMAT` if the value exceeds it.
+
+---
+
 ## Summary
 
 | # | File | Severity | Remote? | Priv-esc? | Description |
@@ -357,12 +504,17 @@ assigning to `ts.tv_sec`, or use an explicit cast with a range check.
 | 9 | auth2.c:289-326 | **LOW** | **Yes** | No | Unsanitised `role`/`style` from client passed to PAM and `setproctitle` |
 | 10 | auth2.c:286 | **INFO** | **Yes** | No | Raw client strings logged before validation — log injection |
 | 11 | auth2.c:263-264 | **INFO** | No | No | Implicit `double`→`time_t` cast in timing delay; unchecked for out-of-range |
+| 12 | kex.c:185 | **LOW** | **Yes (if GSSAPI)** | No | GSS algorithm lookup uses `strncmp` prefix match; crafted names with extra suffixes match known entries |
+| 13 | kex.c:1622 | **LOW** | **Yes** | No | Control characters in SSH version banner not filtered; log injection before key exchange |
+| 14 | kex.c:1194 | **INFO** | No | No | `proposals_match` permanently mutates proposal strings — latent correctness hazard |
+| 15 | kex.c:746 | **INFO** | **Yes (client)** | No | No length cap on `server-sig-algs` EXT_INFO value; malicious server can induce O(n·m) algorithm-matching work |
 
 **Remote exploitability:** Findings 1–8 are not reachable via port 22 —
 they affect `sshd-socket-generator` (a boot-time utility) or a startup-only
-code path in `sshd.c`.  Findings 9 and 10 are reachable by any unauthenticated
-remote client: the vulnerable code executes during SSH2 user-authentication
-packet processing, before credentials are verified.
+code path in `sshd.c`.  Findings 9, 10, 12, and 13 are reachable by any
+unauthenticated remote client.  Finding 13 is reachable before key exchange
+begins — earlier in the connection lifecycle than any other finding.
+Finding 15 affects SSH clients connecting to a malicious server.
 
 **Privilege escalation:** No finding enables direct privilege escalation.
 Finding #4 (TOCTOU) is a privilege-escalation primitive only when systemd
