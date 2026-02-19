@@ -3,7 +3,9 @@
 This document records findings from a source-level security review of the
 sshd-related code in this tree, with particular focus on the new
 `sshd-socket-generator.c` file, the systemd socket-activation additions
-to `sshd.c`, and the SSH2 user-authentication dispatcher in `auth2.c`.
+to `sshd.c`, the SSH2 user-authentication dispatcher in `auth2.c`, the
+key exchange layer in `kex.c`, and the transport packet layer in
+`packet.c`.
 
 Severity ratings: **CRITICAL / HIGH / MEDIUM / LOW / INFO**
 
@@ -489,6 +491,218 @@ and return `SSH_ERR_INVALID_FORMAT` if the value exceeds it.
 
 ---
 
+## 16. Wrong Sequence Number in Non-AEAD First-Block Decryption
+
+**File:** `packet.c:1525-1527`
+**Severity:** LOW
+
+```c
+if ((r = cipher_crypt(state->receive_context,
+    state->p_send.seqnr, cp, sshbuf_ptr(state->input),   /* ← p_send, not p_read */
+    block_size, 0, 0)) != 0)
+    goto out;
+```
+
+When decrypting the first cipher block of an incoming non-AEAD packet to
+extract the packet length, `cipher_crypt` is called with
+`state->p_send.seqnr` — the **outbound** sequence counter — rather than
+`state->p_read.seqnr`, which is the **inbound** counter used everywhere
+else in the same function (line 1593).
+
+**Impact today:** No functional corruption occurs with the current cipher
+suite.  AES-CBC and AES-CTR implementations ignore the `seqnr` argument
+entirely; chacha20-poly1305 (the only SSH2 cipher that uses the seqnr as a
+nonce) takes the AEAD code path where `cipher_get_length()` is used
+instead, so it never reaches this branch.  The values of `p_send.seqnr`
+and `p_read.seqnr` will also typically differ, meaning any future non-AEAD
+cipher that does use the seqnr would silently decrypt the first block with
+the wrong nonce — producing garbage packet lengths without a clear error
+indication.
+
+**Recommendation:** Replace `state->p_send.seqnr` with
+`state->p_read.seqnr` at line 1526.
+
+---
+
+## 17. Unbounded Decompression in `uncompress_buffer()` (Zip Bomb)
+
+**File:** `packet.c:777-822`
+**Severity:** MEDIUM
+
+```c
+for (;;) {
+    ssh->state->compression_in_stream.next_out = buf;
+    ssh->state->compression_in_stream.avail_out = sizeof(buf);  /* 4096 bytes */
+    status = inflate(..., Z_SYNC_FLUSH);
+    switch (status) {
+    case Z_OK:
+        sshbuf_put(out, buf, sizeof(buf) - ...avail_out);  /* no output cap */
+        break;
+    case Z_BUF_ERROR:
+        return 0;   /* only exit: zlib says "done" */
+    ...
+    }
+}
+```
+
+The `inflate()` loop appends decompressed data to `out` indefinitely.
+There is no limit on the total decompressed output size.
+
+Incoming encrypted packets are capped at `PACKET_MAX_SIZE` = 256 KB
+(line 106), but that limit applies to the ciphertext, not the plaintext.
+A 256 KB maximally-compressed payload can expand to hundreds of megabytes.
+A malicious peer that has completed key exchange can therefore trigger a
+memory-exhaustion condition with a single packet.
+
+**Trigger window:** `COMP_DELAYED` compression (`zlib@openssh.com`)
+activates after authentication; legacy `COMP_ZLIB` activates immediately
+after key exchange without requiring authentication.
+
+**Recommendation:** Track the total bytes written to `out` inside the
+loop and return `SSH_ERR_INVALID_FORMAT` when the total exceeds a
+reasonable bound (e.g. `PACKET_MAX_SIZE * 8` or a configurable constant).
+
+---
+
+## 18. `kex_from_blob()` Hardcodes `kex->server = 1` Without Documentation
+
+**File:** `packet.c:2436`
+**Severity:** INFO
+
+```c
+kex->server = 1;   /* unconditional, regardless of actual role */
+kex->done = 1;
+```
+
+`kex_from_blob()` deserialises the key-exchange state from the privilege-
+separation blob.  It unconditionally sets `kex->server = 1` with no
+comment, assertion, or parameter to indicate that this is intentionally
+server-only.
+
+In the current call graph this is always correct: `kex_from_blob` is
+only reached via `ssh_packet_set_state()`, which is only called in the
+monitor (always the server side).  However, the function has no guard
+that prevents future use in a client-side privsep or multiplexer context.
+If `kex_from_blob` were reused there, the client's kex struct would be
+silently misconfigured as a server, corrupting algorithm dispatch and
+session setup without a clear error.
+
+**Recommendation:** Either pass the role as a parameter to `kex_from_blob`
+(e.g. `int is_server`) and assign it there, or add an assertion that
+the call site is always the server side.
+
+---
+
+## 19. `ssh_packet_disconnect()` Uses a Process-Global `static int disconnecting`
+
+**File:** `packet.c:1976`
+**Severity:** INFO
+
+```c
+void ssh_packet_disconnect(struct ssh *ssh, const char *fmt, ...)
+{
+    static int disconnecting = 0;   /* process-global, not per-connection */
+    if (disconnecting)
+        fatal("packet_disconnect called recursively.");
+    disconnecting = 1;
+    ...
+    cleanup_exit(255);
+}
+```
+
+The recursion guard is a process-global static variable, not a member of
+`struct session_state`.  In any context where multiple `struct ssh`
+objects exist in the same process (the ssh connection multiplexer, future
+multi-connection daemon designs), calling `ssh_packet_disconnect` on any
+one connection permanently sets `disconnecting = 1` for the entire process.
+A subsequent legitimate disconnect call for a *different* connection would
+hit `fatal("packet_disconnect called recursively.")` instead of sending the
+proper `SSH2_MSG_DISCONNECT` message and closing cleanly.
+
+In current OpenSSH sshd usage the function always calls `cleanup_exit(255)`
+before returning, so the guard is never "left set" in practice.  The
+pattern is nonetheless unsafe for any multi-connection reuse of this code.
+
+**Recommendation:** Move `disconnecting` into `struct session_state` as a
+per-connection flag.
+
+---
+
+## 20. Potential Shift UB in Rekey Block-Limit Calculation
+
+**File:** `packet.c:946`
+**Severity:** INFO
+
+```c
+if (enc->block_size >= 16)
+    *max_blocks = (u_int64_t)1 << (enc->block_size * 2);
+```
+
+For `enc->block_size = 32` the shift amount would be 64, which is
+**undefined behaviour** in C (C11 §6.5.7p3: the shift amount must be less
+than the width of the promoted left operand — 64 bits for `u_int64_t`).
+
+No standard SSH2 cipher has a 32-byte block size (AES uses 16 bytes), so
+this is not reachable in practice today.  The `>= 16` guard does not
+prevent a future cipher registration with a larger block size from silently
+invoking UB, and compilers are permitted to assume this path is unreachable,
+potentially misoptimising surrounding code.
+
+**Recommendation:** Add an explicit upper-bound guard:
+```c
+if (enc->block_size >= 16 && (enc->block_size * 2) < 64)
+    *max_blocks = (u_int64_t)1 << (enc->block_size * 2);
+else
+    *max_blocks = UINT64_MAX;   /* effectively unlimited; rely on rekey_limit */
+```
+
+---
+
+## 21. `newkeys_from_blob()` Validates MAC Key Length but Not Cipher Key/IV Lengths
+
+**File:** `packet.c:2375-2404`
+**Severity:** LOW
+
+```c
+if ((r = sshbuf_get_string(b, &enc->key, &keylen)) != 0 ||
+    (r = sshbuf_get_string(b, &enc->iv,  &ivlen))  != 0)
+    goto out;
+...
+/* MAC key IS validated: */
+if (maclen > mac->key_len) { r = SSH_ERR_INVALID_FORMAT; goto out; }
+mac->key_len = maclen;
+
+/* Cipher key and IV are NOT validated: */
+enc->key_len = keylen;   /* taken blindly from the blob */
+enc->iv_len  = ivlen;    /* taken blindly from the blob */
+```
+
+The MAC key length deserialized from the privsep blob is cross-checked
+against the expected `mac->key_len` for the negotiated MAC algorithm.
+The cipher key and IV lengths are not checked against the cipher's
+expected sizes — they are stored and later forwarded to `cipher_init()`
+directly.  A mismatch results in silent key truncation or extension; the
+error (if any) surfaces only at cipher initialisation time, not at blob-
+parse time.
+
+**Attack surface:** The state blob is written by the privileged monitor
+process and consumed in `ssh_packet_set_state()` during the privsep
+handoff.  Tampering requires compromising the network child, which is a
+high bar.  This is nonetheless a defence-in-depth gap given that the MAC
+key receives validation the cipher keys do not.
+
+**Recommendation:** After resolving the cipher name with `cipher_by_name`,
+validate key and IV lengths:
+```c
+if (keylen != cipher_keylen(enc->cipher) ||
+    ivlen  != cipher_ivlen(enc->cipher)) {
+    r = SSH_ERR_INVALID_FORMAT;
+    goto out;
+}
+```
+
+---
+
 ## Summary
 
 | # | File | Severity | Remote? | Priv-esc? | Description |
@@ -508,13 +722,20 @@ and return `SSH_ERR_INVALID_FORMAT` if the value exceeds it.
 | 13 | kex.c:1622 | **LOW** | **Yes** | No | Control characters in SSH version banner not filtered; log injection before key exchange |
 | 14 | kex.c:1194 | **INFO** | No | No | `proposals_match` permanently mutates proposal strings — latent correctness hazard |
 | 15 | kex.c:746 | **INFO** | **Yes (client)** | No | No length cap on `server-sig-algs` EXT_INFO value; malicious server can induce O(n·m) algorithm-matching work |
+| 16 | packet.c:1526 | **LOW** | **Yes** | No | Wrong seqnr (`p_send` vs `p_read`) in non-AEAD first-block decryption |
+| 17 | packet.c:777-820 | **MEDIUM** | **Yes** | No | No decompression output size limit in `uncompress_buffer()` — zip bomb / memory exhaustion |
+| 18 | packet.c:2436 | **INFO** | No | No | `kex_from_blob()` hardcodes `kex->server = 1`; unsafe if ever used in non-server context |
+| 19 | packet.c:1976 | **INFO** | No | No | `static int disconnecting` is process-global, not per-connection — unsafe for multi-connection reuse |
+| 20 | packet.c:946 | **INFO** | No | No | Shift UB: `1 << (block_size*2)` is undefined for `block_size >= 32` |
+| 21 | packet.c:2375-2404 | **LOW** | No | No | MAC key length validated in `newkeys_from_blob()`; cipher key/IV lengths are not |
 
 **Remote exploitability:** Findings 1–8 are not reachable via port 22 —
 they affect `sshd-socket-generator` (a boot-time utility) or a startup-only
-code path in `sshd.c`.  Findings 9, 10, 12, and 13 are reachable by any
-unauthenticated remote client.  Finding 13 is reachable before key exchange
-begins — earlier in the connection lifecycle than any other finding.
-Finding 15 affects SSH clients connecting to a malicious server.
+code path in `sshd.c`.  Findings 9, 10, 12, 13, 16, and 17 are reachable
+by any connecting client.  Finding 13 is the earliest — reachable before
+key exchange begins.  Finding 17 requires key exchange (and for
+`zlib@openssh.com`, authentication) to be complete first.  Finding 15
+affects SSH clients connecting to a malicious server.
 
 **Privilege escalation:** No finding enables direct privilege escalation.
 Finding #4 (TOCTOU) is a privilege-escalation primitive only when systemd
