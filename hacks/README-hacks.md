@@ -246,6 +246,62 @@ python3 hacks/poc4_toctou_symlink.py    # race should no longer land the file
 
 ---
 
+## Privilege Escalation Analysis
+
+### Can a non-privileged user gain root using these PoCs?
+
+Not directly with any single PoC in isolation.  Here is what each one
+actually provides an attacker:
+
+**PoC #1 (OOB read)** — Causes wrong behaviour (corrupted path) rather than
+code execution.  No privilege escalation path on its own.  If the OOB read
+were on a writable memory boundary it might become a write primitive, but it
+is not in this case.
+
+**PoC #2 (strtonum/errno)** — No privilege escalation.  Causes sshd to
+misconfigure its socket activation silently, which is a reliability and
+security-policy bypass, not a path to root.
+
+**PoC #3 (path traversal)** — Requires the attacker to already control
+`argv[1]`, meaning they would need root or another exploit to invoke the
+generator with crafted arguments.  Not a privilege escalation by itself.
+
+**PoC #4 (TOCTOU) — Most dangerous.**  A non-privileged local user *can*
+win the race.  When the generator is invoked by systemd (which runs it as
+root), winning the race allows the attacker to cause the generator to
+create or truncate a file in a privileged directory such as `/etc/cron.d`.
+This is a **local privilege escalation primitive**:
+
+```
+1. Attacker wins the race against the root-owned generator process.
+2. Generator (running as root) creates /etc/cron.d/addresses.conf
+   with attacker-influenced content derived from the ListenStream= lines.
+3. cron picks up the new file and executes a command as root.
+```
+
+**Conditions required to complete the escalation chain:**
+
+- The generator must be invoked by systemd (e.g. on boot or
+  `systemctl daemon-reload`) — the attacker cannot trigger this directly
+  without already having elevated access.
+- The file content is partially constrained to systemd socket unit format,
+  so crafting valid cron syntax requires the listen address values in
+  `sshd_config` to embed the payload — which in turn requires write access
+  to `/etc/ssh/sshd_config`.
+- Alternatively, the attacker could target a path where partial content
+  control is sufficient (e.g. truncating a sensitive file to zero bytes as
+  a denial-of-service, or targeting a directory where file *creation* alone
+  triggers a privileged action).
+
+**Bottom line:** PoC #4 is a confirmed local privilege escalation primitive
+that requires chaining with at least one additional condition (ability to
+influence `sshd_config` content, or a suitable alternative target path).
+Without chaining it is a reliable local denial-of-service via file
+truncation.  The TOCTOU fix on branch `security-flaw-fixes` (using
+`openat(O_NOFOLLOW)`) eliminates the primitive entirely.
+
+---
+
 ## Disclaimer
 
 These scripts are provided solely for security research and defensive
