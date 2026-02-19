@@ -1,0 +1,209 @@
+#!/bin/bash
+
+test_default() (
+    set -xeuo pipefail
+
+    /usr/lib/systemd/system-generators/sshd-socket-generator "$testdir"
+
+    # Nothing should be generated in this case.
+    test ! -e "$testdir/ssh.socket.d"
+)
+
+test_custom_port() (
+    set -xeuo pipefail
+
+    echo "Port 1234" >> "$testconf"
+
+    /usr/lib/systemd/system-generators/sshd-socket-generator "$testdir"
+
+    grep -q "^ListenStream=0.0.0.0:1234" "$socket_override"
+    grep -q "^ListenStream=\[::\]:1234" "$socket_override"
+)
+
+test_custom_family_ipv4() (
+    set -xeuo pipefail
+
+    echo "AddressFamily inet" >> "$testconf"
+
+    /usr/lib/systemd/system-generators/sshd-socket-generator "$testdir"
+
+    grep -q "^ListenStream=0.0.0.0:22" "$socket_override"
+
+    if grep -q "^ListenStream=\[::\]:22" "$socket_override"; then
+        >&2 echo "IPv6 address generated with AddressFamily inet"
+        return 1
+    fi
+)
+
+test_custom_family_ipv6() (
+    set -xeuo pipefail
+
+    echo "AddressFamily inet6" >> "$testconf"
+
+    /usr/lib/systemd/system-generators/sshd-socket-generator "$testdir"
+
+    grep -q "^ListenStream=\[::\]:22" "$socket_override"
+
+    if grep -q "^ListenStream=0.0.0.0:22" "$socket_override"; then
+        >&2 echo "IPv4 address generated with AddressFamily inet6"
+        return 1
+    fi
+)
+
+test_custom_port_and_family_ipv4() (
+    set -xeuo pipefail
+
+    echo "Port 1234" >> "$testconf"
+    echo "AddressFamily inet" >> "$testconf"
+
+    /usr/lib/systemd/system-generators/sshd-socket-generator "$testdir"
+
+    grep -q "^ListenStream=0.0.0.0:1234" "$socket_override"
+
+    if grep -q "^ListenStream=\[::\]:1234" "$socket_override"; then
+        >&2 echo "IPv6 address generated with AddressFamily inet"
+        return 1
+    fi
+)
+
+test_custom_port_and_family_ipv6() (
+    set -xeuo pipefail
+
+    echo "Port 1234" >> "$testconf"
+    echo "AddressFamily inet6" >> "$testconf"
+
+    /usr/lib/systemd/system-generators/sshd-socket-generator "$testdir"
+
+    grep -q "^ListenStream=\[::\]:1234" "$socket_override"
+
+    if grep -q "^ListenStream=0.0.0.0:1234" "$socket_override"; then
+        >&2 echo "IPv4 address generated with AddressFamily inet6"
+        return 1
+    fi
+)
+
+test_default_and_custom_port() (
+    set -xeuo pipefail
+
+    # LP: #2059872
+    echo "Port 22" >> "$testconf"
+    echo "Port 1234" >> "$testconf"
+
+    /usr/lib/systemd/system-generators/sshd-socket-generator "$testdir"
+
+    grep -q "^ListenStream=0.0.0.0:22" "$socket_override"
+    grep -q "^ListenStream=0.0.0.0:1234" "$socket_override"
+    grep -q "^ListenStream=\[::\]:22" "$socket_override"
+    grep -q "^ListenStream=\[::\]:1234" "$socket_override"
+)
+
+test_mutiple_custom_ports() (
+    set -xeuo pipefail
+
+    echo "Port 1234" >> "$testconf"
+    echo "Port 4321" >> "$testconf"
+
+    /usr/lib/systemd/system-generators/sshd-socket-generator "$testdir"
+
+    grep -q "^ListenStream=0.0.0.0:1234" "$socket_override"
+    grep -q "^ListenStream=0.0.0.0:4321" "$socket_override"
+    grep -q "^ListenStream=\[::\]:1234" "$socket_override"
+    grep -q "^ListenStream=\[::\]:4321" "$socket_override"
+)
+
+test_custom_listenaddress() (
+    set -xeuo pipefail
+
+    echo "ListenAddress 10.1.2.3" >> "$testconf"
+
+    /usr/lib/systemd/system-generators/sshd-socket-generator "$testdir"
+
+    grep -q "^ListenStream=10.1.2.3:22" "$socket_override"
+)
+
+test_custom_listenaddress_and_port() (
+    set -xeuo pipefail
+
+    echo "Port 1234" >> "$testconf"
+    echo "ListenAddress 10.1.2.3" >> "$testconf"
+
+    /usr/lib/systemd/system-generators/sshd-socket-generator "$testdir"
+
+    grep -q "^ListenStream=10.1.2.3:1234" "$socket_override"
+)
+
+test_custom_ipv6_listenaddress() (
+    set -xeuo pipefail
+
+    echo "ListenAddress 2001:db8:85a3::8a2e:370:7334" >> "$testconf"
+
+    /usr/lib/systemd/system-generators/sshd-socket-generator "$testdir"
+
+    grep -q "^ListenStream=\[2001:db8:85a3::8a2e:370:7334\]:22" "$socket_override"
+)
+
+test_match_on_port() (
+    # Regression test for LP: #2076023
+    set -xeuo pipefail
+
+    echo "Port 22" >> "$testconf"
+    echo "Port 22222" >> "$testconf"
+    echo "Match LocalPort 22222" >> "$testconf"
+    echo "    PasswordAuthentication no" >> "$testconf"
+    echo "    PubkeyAuthentication yes" >> "$testconf"
+
+    /usr/lib/systemd/system-generators/sshd-socket-generator "$testdir"
+
+    grep -q "^ListenStream=0.0.0.0:22$" "$socket_override"
+    grep -q "^ListenStream=0.0.0.0:22222$" "$socket_override"
+    grep -q "^ListenStream=\[::\]:22$" "$socket_override"
+    grep -q "^ListenStream=\[::\]:22222$" "$socket_override"
+)
+
+tmpdir="$(mktemp -d)"
+testconf="/etc/ssh/sshd_config.d/test.conf"
+failed=
+
+mkdir -p /etc/ssh/sshd_config.d
+
+for test_fn in \
+    "test_default" \
+    "test_custom_port" \
+    "test_default_and_custom_port" \
+    "test_mutiple_custom_ports" \
+    "test_custom_listenaddress" \
+    "test_custom_listenaddress_and_port" \
+    "test_custom_ipv6_listenaddress" \
+    "test_match_on_port" \
+    "test_custom_family_ipv4" \
+    "test_custom_family_ipv6" \
+    "test_custom_port_and_family_ipv4" \
+    "test_custom_port_and_family_ipv6"
+do
+    echo -n "$test_fn..."
+
+    testdir="${tmpdir}/${test_fn}"
+    socket_override="${testdir}/ssh.socket.d/addresses.conf"
+    mkdir -p "$testdir"
+
+    $test_fn > "${AUTOPKGTEST_ARTIFACTS}/${test_fn}.log" 2>&1
+    if [[ $? -eq 0 ]]; then
+        echo "PASS"
+    else
+        echo "FAIL"
+        failed="${failed:+$failed }$test_fn"
+    fi
+
+    >"$testconf"
+done
+
+if [[ -n "$failed" ]]; then
+    for t in $failed; do
+        echo "--------------------------------------------"
+        echo "FAIL: $t"
+        echo "--------------------------------------------"
+        cat "${AUTOPKGTEST_ARTIFACTS}/${t}.log"
+    done
+
+    exit 1
+fi

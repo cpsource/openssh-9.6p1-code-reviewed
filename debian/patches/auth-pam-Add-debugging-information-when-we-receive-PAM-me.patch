@@ -1,0 +1,23 @@
+From: =?utf-8?b?Ik1hcmNvIFRyZXZpc2FuIChUcmV2acOxbyki?= <mail@3v1n0.net>
+Date: Tue, 17 Oct 2023 04:35:17 +0200
+Subject: auth-pam: Add debugging information when we receive PAM messages
+
+Origin: https://github.com/openssh/openssh-portable/pull/452
+---
+ auth-pam.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/auth-pam.c b/auth-pam.c
+index 2129163..7a72e72 100644
+--- a/auth-pam.c
++++ b/auth-pam.c
+@@ -450,6 +450,9 @@ sshpam_thread_conv(int n, sshpam_const struct pam_message **msg,
+ 			break;
+ 		case PAM_ERROR_MSG:
+ 		case PAM_TEXT_INFO:
++			debug3("PAM: Got message of type %d: %s",
++			       PAM_MSG_MEMBER(msg, i, msg_style),
++			       PAM_MSG_MEMBER(msg, i, msg));
+ 			if ((r = sshbuf_put_cstring(buffer,
+ 			    PAM_MSG_MEMBER(msg, i, msg))) != 0)
+ 				fatal("%s: buffer error: %s",

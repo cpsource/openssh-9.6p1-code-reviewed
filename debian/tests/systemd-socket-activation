@@ -1,0 +1,57 @@
+#!/bin/bash
+
+set -euo pipefail
+
+assert_unit_property() {
+    local property="$(echo "$2" | awk -F'=' '{print $1}')"
+
+    local expect="$2"
+    local actual="$(systemctl show -p "$property" "$1")"
+
+    if [[ "$actual" != "$expect" ]]; then
+        echo "Fail: $1: expected $expect, but got $actual"
+        return 1
+    fi
+}
+
+# Generate RSA key and add it to this user's authorized keys.
+ssh-keygen -t rsa -N "" -f "$HOME/.ssh/id_rsa" -q
+if [[ -f ~/.ssh/authorized_keys ]]; then
+    touch ~/.ssh/authorized_keys
+    chmod 0600 ~/.ssh/authorized_keys
+fi
+cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
+
+# Make sure ssh.service is not running.
+echo "Stopping ssh.service..."
+systemctl stop ssh.service 2>/dev/null
+
+# Check that ssh.socket is active and listening.
+echo "Checking that ssh.socket is active and listening..."
+assert_unit_property ssh.socket "ActiveState=active"
+assert_unit_property ssh.socket "SubState=listening"
+
+# Check that ssh.service is currently inactive/dead.
+echo "Checking that ssh.service is inactive/dead..."
+assert_unit_property ssh.service "ActiveState=inactive"
+assert_unit_property ssh.service "SubState=dead"
+
+# Check that a connection attempt successfully activates ssh.service.
+echo "Checking that a connection attempt activates ssh.service..."
+ssh -oStrictHostKeyChecking=no localhost -- /usr/bin/true
+assert_unit_property ssh.service "ActiveState=active"
+assert_unit_property ssh.service "SubState=running"
+
+# Check that we can re-execute sshd via systemctl reload.
+echo "Checking that sshd can be re-executed..."
+systemctl reload ssh.service
+assert_unit_property ssh.service "ActiveState=active"
+assert_unit_property ssh.service "SubState=running"
+
+# Check that we can run sshd in debug mode.
+echo "Checking sshd can run in debug mode..."
+systemctl stop ssh.service 2>/dev/null
+sed -i 's/^SSHD_OPTS=.*/SSHD_OPTS=-ddd/g' /etc/default/ssh
+ssh -oStrictHostKeyChecking=no localhost -- /usr/bin/true
+
+echo "Done."

@@ -1,0 +1,41 @@
+Description: Set UsePAM=no for regress/putty-*.sh
+ Currently these tests fails in the autopkgtest infrastructure due to pam_loginuid.so
+ failures. These failures cannot currently be replicated locally. Workaround this
+ by setting UsePAM=no for the failing tests since their functionality is not tesing
+ PAM.
+Author: Nick Rosbrook <nick.rosbrook@canonical.com>
+Forwarded: no
+Last-Update: 2023-05-25
+--- a/regress/putty-ciphers.sh
++++ b/regress/putty-ciphers.sh
+@@ -14,6 +14,8 @@
+ 	echo "PubkeyAcceptedKeyTypes +ssh-rsa" >> ${OBJ}/sshd_proxy
+ fi
+ 
++sed -i "s/UsePAM.*/UsePAM no/" ${OBJ}/sshd_proxy
++
+ for c in aes 3des aes128-ctr aes192-ctr aes256-ctr chacha20 ; do
+ 	verbose "$tid: cipher $c"
+ 	cp ${OBJ}/.putty/sessions/localhost_proxy \
+--- a/regress/putty-kex.sh
++++ b/regress/putty-kex.sh
+@@ -14,6 +14,8 @@
+ 	echo "PubkeyAcceptedKeyTypes +ssh-rsa" >> ${OBJ}/sshd_proxy
+ fi
+ 
++sed -i "s/UsePAM.*/UsePAM no/" ${OBJ}/sshd_proxy
++
+ for k in dh-gex-sha1 dh-group1-sha1 dh-group14-sha1 ecdh ; do
+ 	verbose "$tid: kex $k"
+ 	cp ${OBJ}/.putty/sessions/localhost_proxy \
+--- a/regress/putty-transfer.sh
++++ b/regress/putty-transfer.sh
+@@ -14,6 +14,8 @@
+ 	echo "PubkeyAcceptedKeyTypes +ssh-rsa" >> ${OBJ}/sshd_proxy
+ fi
+ 
++sed -i "s/UsePAM.*/UsePAM no/" ${OBJ}/sshd_proxy
++
+ if [ "`${SSH} -Q compression`" = "none" ]; then
+ 	comp="0"
+ else

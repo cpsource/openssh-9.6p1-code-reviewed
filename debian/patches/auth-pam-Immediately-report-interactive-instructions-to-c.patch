@@ -1,0 +1,73 @@
+From: =?utf-8?b?Ik1hcmNvIFRyZXZpc2FuIChUcmV2acOxbyki?= <mail@3v1n0.net>
+Date: Tue, 17 Oct 2023 04:27:32 +0200
+Subject: auth-pam: Immediately report interactive instructions to clients
+
+SSH keyboard-interactive authentication method supports instructions but
+sshd didn't show them until an user prompt was requested.
+
+This is quite inconvenient for various PAM modules that need to notify
+an user without requiring for their explicit input.
+
+So, properly implement RFC4256 making instructions to be shown to users
+when they are requested from PAM.
+
+Closes: https://bugzilla.mindrot.org/show_bug.cgi?id=2876
+
+Origin: https://github.com/openssh/openssh-portable/pull/452
+---
+ auth-pam.c | 21 ++++++++++++---------
+ 1 file changed, 12 insertions(+), 9 deletions(-)
+
+diff --git a/auth-pam.c b/auth-pam.c
+index 7a72e72..b756f0e 100644
+--- a/auth-pam.c
++++ b/auth-pam.c
+@@ -140,6 +140,7 @@ typedef int SshPamDone;
+ #define SshPamError -1
+ #define SshPamNone 0
+ #define SshPamAuthenticated 1
++#define SshPamAgain 2
+ 
+ struct pam_ctxt {
+ 	sp_pthread_t	 pam_thread;
+@@ -868,6 +869,8 @@ sshpam_query(void *ctx, char **name, char **info,
+ 	**prompts = NULL;
+ 	plen = 0;
+ 	*echo_on = xmalloc(sizeof(u_int));
++	ctxt->pam_done = SshPamNone;
++
+ 	while (ssh_msg_recv(ctxt->pam_psock, buffer) == 0) {
+ 		if (++nmesg > PAM_MAX_NUM_MSG)
+ 			fatal_f("too many query messages");
+@@ -888,15 +891,13 @@ sshpam_query(void *ctx, char **name, char **info,
+ 			return (0);
+ 		case PAM_ERROR_MSG:
+ 		case PAM_TEXT_INFO:
+-			/* accumulate messages */
+-			len = plen + mlen + 2;
+-			**prompts = xreallocarray(**prompts, 1, len);
+-			strlcpy(**prompts + plen, msg, len - plen);
+-			plen += mlen;
+-			strlcat(**prompts + plen, "\n", len - plen);
+-			plen++;
+-			free(msg);
+-			break;
++			*num = 0;
++			free(*info);
++			*info = msg; /* Steal the message */
++			msg = NULL;
++			ctxt->pam_done = SshPamAgain;
++			sshbuf_free(buffer);
++			return (0);
+ 		case PAM_ACCT_EXPIRED:
+ 		case PAM_MAXTRIES:
+ 			if (type == PAM_ACCT_EXPIRED)
+@@ -1001,6 +1002,8 @@ sshpam_respond(void *ctx, u_int num, char **resp)
+ 		return KbdintResultSuccess;
+ 	case SshPamNone:
+ 		break;
++	case SshPamAgain:
++		return KbdintResultAgain;
+ 	default:
+ 		return KbdintResultFailure;
+ 	}
