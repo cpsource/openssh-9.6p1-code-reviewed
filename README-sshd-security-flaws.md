@@ -4,8 +4,8 @@ This document records findings from a source-level security review of the
 sshd-related code in this tree, with particular focus on the new
 `sshd-socket-generator.c` file, the systemd socket-activation additions
 to `sshd.c`, the SSH2 user-authentication dispatcher in `auth2.c`, the
-key exchange layer in `kex.c`, and the transport packet layer in
-`packet.c`.
+key exchange layer in `kex.c`, the transport packet layer in `packet.c`,
+and the UMAC message-authentication implementation in `umac.c`.
 
 Severity ratings: **CRITICAL / HIGH / MEDIUM / LOW / INFO**
 
@@ -703,6 +703,199 @@ if (keylen != cipher_keylen(enc->cipher) ||
 
 ---
 
+## 22. UMAC 16 MB Message Limit Not Enforced at Runtime
+
+**File:** `umac.c:827-848` (`poly_hash()`)
+**Severity:** LOW
+
+```c
+/* umac.c:827-831 — documented but never enforced */
+/* Although UMAC is specified to use a ramped polynomial hash scheme, this
+ * implementation does not handle all ramp levels. Because we don't handle
+ * the ramp up to p128 modulus in this implementation, we are limited to
+ * 2^14 poly_hash() invocations per stream (for a total capacity of 2^24
+ * bytes input to UMAC per tag, ie. 16MB).
+ */
+static void poly_hash(uhash_ctx_t hc, UINT32 data_in[])
+{
+    /* called once per 1024-byte chunk — no invocation counter, no guard */
+```
+
+UMAC RFC 4418 §4.1 specifies a ramped polynomial scheme that transitions
+from a p64 modulus (for short messages) to a p128 modulus (for messages
+over 16 MB).  This implementation only handles the p64 stage.  After
+2^14 calls to `poly_hash()` (one per 1024-byte NH block, totalling 16 MB),
+the polynomial accumulator cycles beyond the p64 domain silently, producing
+a structurally valid but cryptographically wrong MAC tag — with no error
+return, no assertion, and no counter to detect the overflow.
+
+**In SSH:** each SSH packet is independently capped at `PACKET_MAX_SIZE`
+(~256 KB), and each packet gets its own `umac_final()` call, so individual
+UMAC sessions never approach 16 MB.  The limit is not reachable in practice.
+
+**Risk:** no assertion or runtime check documents the invariant that keeps
+this safe.  If UMAC were reused with a message stream that exceeds 16 MB
+(e.g. in a future bulk-data path or an external caller linking against this
+code), the wrong MAC would be produced silently — potentially allowing a MAC
+forgery without any error indication.
+
+**Recommendation:** Add a runtime guard in `uhash_update()`:
+```c
+if (ctx->msg_len + len > (1UL << 24))
+    return SSH_ERR_INVALID_FORMAT;   /* or fatal() */
+```
+
+---
+
+## 23. Signed Integer Overflow in `nh_final()` — `bytes_hashed << 3`
+
+**File:** `umac.c:692`
+**Severity:** INFO
+
+```c
+/* nh_ctx.bytes_hashed is declared 'int' (line 325) */
+nbits = (hc->bytes_hashed << 3);   /* UB if bytes_hashed > 2^28 */
+```
+
+Left-shifting a `signed int` into or past the sign bit is undefined
+behaviour (C11 §6.5.7p4).  If `bytes_hashed` exceeded 2^28 (256 MB),
+`bytes_hashed * 8` would overflow a 32-bit signed integer.  The result is
+then added to all NH state accumulators, corrupting the hash output.
+
+**In practice** `bytes_hashed` is reset by `nh_reset()` after each 1024-byte
+block (called from `nh_final()`), so its value never exceeds 1024.  The UB
+is unreachable given SSH packet-size constraints.
+
+Compare with `nh()` (line 718): `UINT32 nbits = (unpadded_len << 3)` —
+the same computation performed on an *unsigned* type, which is well-defined.
+The inconsistency in type choice between the two code paths is the root issue.
+
+**Recommendation:** Declare `bytes_hashed` as `UINT32` (matching its
+initialiser and all its arithmetic counterparts), or cast before shifting:
+```c
+nbits = ((UINT32)hc->bytes_hashed << 3);
+```
+
+---
+
+## 24. `kdf()` Counter Byte Truncation — Silent Wrap at 256 AES Blocks
+
+**File:** `umac.c:199`
+**Severity:** INFO
+
+```c
+static void kdf(void *bufp, aes_int_key key, UINT8 ndx, int nbytes)
+{
+    UINT8 in_buf[AES_BLOCK_LEN] = {0};
+    int i;
+    in_buf[AES_BLOCK_LEN-1] = i = 1;
+
+    while (nbytes >= AES_BLOCK_LEN) {
+        aes_encryption(in_buf, out_buf, key);
+        in_buf[AES_BLOCK_LEN-1] = ++i;   /* int → UINT8: wraps at i=256 */
+        nbytes -= AES_BLOCK_LEN;
+```
+
+The AES counter is maintained as an `int` variable `i` but stored in a
+single `UINT8` array slot.  The assignment `in_buf[AES_BLOCK_LEN-1] = ++i`
+silently truncates the `int` to 8 bits.  When `i` reaches 256 (after 256
+AES encryptions / 4096 bytes derived), the stored counter byte wraps back
+to 0, causing the counter-mode keystream to repeat from the beginning.
+A repeated keystream reveals the XOR of the two messages encrypted at the
+same counter position — in a KDF context, this means derived key material
+could partially repeat.
+
+**In practice** the maximum `nbytes` ever requested is
+`(8 * STREAMS + 4) * sizeof(UINT64)` = 352 bytes (for `STREAMS = 4`), which
+requires only ~22 AES encryptions.  The wrap is unreachable.
+
+**Recommendation:** Use a `UINT8` loop counter with an explicit static
+assert, or add a defensive check:
+```c
+static_assert(/* max nbytes across all kdf callers */ <= 256 * AES_BLOCK_LEN,
+              "kdf counter would wrap");
+```
+
+---
+
+## 25. Pervasive Strict-Aliasing UB via `UINT8*` → `UINT64*`/`UINT32*` Casts
+
+**File:** `umac.c` throughout (e.g. lines 258–278, 346, 362, 380, 483–487, 693–701, 720–728)
+**Severity:** INFO
+
+```c
+/* pdf_gen_xor() — nonce is const UINT8* */
+*(UINT32 *)t.tmp_nonce_lo = ((const UINT32 *)nonce)[1];
+
+/* nh_aux() — hp is void* passed from a UINT8 buffer */
+h = *((UINT64 *)hp);
+
+/* nh_final() — result is UINT8* */
+((UINT64 *)result)[0] = ((UINT64 *)hc->state)[0] + nbits;
+```
+
+Accessing a `UINT8` array through `UINT64*` or `UINT32*` pointers violates
+the C11 strict-aliasing rule (§6.5p7): a stored value may only be accessed
+by a pointer to a compatible type, a character type, or a union member.
+Under `-O2` or higher, GCC and Clang are permitted to assume that accesses
+through incompatible pointer types cannot alias, and may reorder or eliminate
+such loads and stores.
+
+The union trick (`union { UINT8 tmp_nonce_lo[4]; UINT32 align; }`) is used
+correctly in `pdf_gen_xor` for the nonce comparison, but the XOR output
+operations and the `nh_aux`/`nh_final` paths use raw casts without a union
+wrapper, which is not sanctioned by the standard even on aligned buffers.
+
+**In practice** this is harmless on x86-64 with current GCC/Clang — the
+pointer casts survive optimisation without incorrect reordering.  The
+`FORCE_C_ONLY` comment at line 64 and the GCC `-O3` correctness note at
+line 44 ("incorrect results are sometimes produced") suggest the original
+author was aware that aggressive optimisation interacts poorly with this
+code.
+
+**Recommendation:** Replace raw pointer casts with `memcpy` for
+portability and strict-aliasing correctness, or use `__attribute__((may_alias))` on
+the pointer types used for multi-byte loads.
+
+---
+
+## 26. `long len` Silently Truncated to `UINT32` at `nh_update()` Boundary
+
+**File:** `umac.c:1044` (`uhash_update()`), `umac.c:613` (`nh_update()`)
+**Severity:** INFO
+
+```c
+/* umac_update() and uhash_update() both take 'long len' */
+int umac_update(struct umac_ctx *ctx, const u_char *input, long len)
+    → uhash_update(uhash_ctx_t ctx, const u_char *input, long len)
+        → nh_update(nh_ctx *hc, const UINT8 *buf, UINT32 nbytes)  /* truncation here */
+```
+
+The public-facing `umac_update()` and internal `uhash_update()` accept a
+`long len`, but the inner `nh_update()` takes a `UINT32 nbytes` parameter.
+The conversion from `long` to `UINT32` at the `nh_update()` call site is
+implicit and silent.  If `len` were greater than `UINT32_MAX` (4 GB),
+`nbytes` would be the low 32 bits of `len` — processing far less data than
+requested — and the resulting MAC would be computed over a truncated message
+without any error indication.
+
+**In SSH:** packets are bounded by `PACKET_MAX_SIZE` (~256 KB), making the
+truncation unreachable.  The type inconsistency across the three call-stack
+levels (`long` → `long` → `UINT32`) is nonetheless a latent hazard if any
+future code path passes a larger buffer.
+
+**Recommendation:** Change `nh_update()`'s `nbytes` parameter to `size_t`
+(matching the standard convention for buffer lengths), add a bounds check
+in `uhash_update()`:
+```c
+if (len > (1UL << 24))
+    return SSH_ERR_INVALID_FORMAT;
+```
+or add a `static_assert` that `PACKET_MAX_SIZE < UINT32_MAX` to document
+the assumed invariant.
+
+---
+
 ## Summary
 
 | # | File | Severity | Remote? | Priv-esc? | Description |
@@ -728,6 +921,11 @@ if (keylen != cipher_keylen(enc->cipher) ||
 | 19 | packet.c:1976 | **INFO** | No | No | `static int disconnecting` is process-global, not per-connection — unsafe for multi-connection reuse |
 | 20 | packet.c:946 | **INFO** | No | No | Shift UB: `1 << (block_size*2)` is undefined for `block_size >= 32` |
 | 21 | packet.c:2375-2404 | **LOW** | No | No | MAC key length validated in `newkeys_from_blob()`; cipher key/IV lengths are not |
+| 22 | umac.c:833 (`poly_hash`) | **LOW** | No | No | 16 MB UMAC message limit documented but not enforced — silent wrong-MAC above threshold |
+| 23 | umac.c:692 (`nh_final`) | **INFO** | No | No | `bytes_hashed << 3` signed-int UB for inputs > 256 MB |
+| 24 | umac.c:199 (`kdf`) | **INFO** | No | No | KDF counter stored in `UINT8` without explicit cast — silent wrap at 256 AES blocks |
+| 25 | umac.c (pervasive) | **INFO** | No | No | `UINT8*` → `UINT64*`/`UINT32*` type-punning violates strict-aliasing rule |
+| 26 | umac.c:1044/613 | **INFO** | No | No | `long len` silently truncated to `UINT32` at `nh_update()` boundary |
 
 **Remote exploitability:** Findings 1–8 are not reachable via port 22 —
 they affect `sshd-socket-generator` (a boot-time utility) or a startup-only
@@ -735,10 +933,247 @@ code path in `sshd.c`.  Findings 9, 10, 12, 13, 16, and 17 are reachable
 by any connecting client.  Finding 13 is the earliest — reachable before
 key exchange begins.  Finding 17 requires key exchange (and for
 `zlib@openssh.com`, authentication) to be complete first.  Finding 15
-affects SSH clients connecting to a malicious server.
+affects SSH clients connecting to a malicious server.  Findings 22–26
+(`umac.c`) are not remotely reachable: the 16 MB threshold (finding 22)
+and the type issues (findings 23–26) are never triggered within SSH's
+PACKET_MAX_SIZE limit.
 
 **Privilege escalation:** No finding enables direct privilege escalation.
 Finding #4 (TOCTOU) is a privilege-escalation primitive only when systemd
 triggers the generator as root and requires chaining with at least one
 additional condition.  The `sshd-socket-generator` binary is installed
 without a setuid bit (`-rwxr-xr-x`).
+
+---
+
+## Man-in-the-Middle Attack Analysis
+
+This section documents SSH's resistance to man-in-the-middle (MITM) attacks
+at the protocol level, the conditions under which that resistance fails, and
+the recommended mitigations.  Unlike the numbered findings above, this is a
+deployment and configuration concern rather than a code-level bug.
+
+### How SSH resists MITM
+
+SSH authenticates the **server to the client** using asymmetric cryptography.
+On every connection the server signs a challenge with its private host key
+(`/etc/ssh/ssh_host_ed25519_key`, etc.).  The client verifies that signature
+against the corresponding public key it has previously recorded in
+`~/.ssh/known_hosts`.  If the key has changed, the client refuses to connect:
+
+```
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+```
+
+An on-path attacker who does not possess the server's private host key
+**cannot** forge the signature.  All session traffic is then protected by an
+ephemeral ECDH session key (curve25519-sha256 by default) negotiated over the
+authenticated channel, so passive interception of recorded traffic is also
+infeasible.
+
+### Where SSH is vulnerable to MITM
+
+#### 1. Trust On First Use (TOFU) — the primary attack window
+
+On the **first ever connection** to a host the client has nothing in
+`known_hosts` to compare against.  It prompts:
+
+```
+The authenticity of host 'example.com (203.0.113.5)' can't be established.
+ED25519 key fingerprint is SHA256:abc123...xyzXYZ.
+Are you sure you want to continue connecting (yes/no/[fingerprint])?
+```
+
+If the user types `yes` without verifying the fingerprint out-of-band, an
+on-path attacker can silently substitute their own public key.  The client
+stores the attacker's key, and all future sessions are transparently proxied
+with no indication of compromise.  **This is the canonical SSH MITM attack —
+it works exactly once, on the first connection.**
+
+Affected code path: `sshconnect.c` → `verify_host_key()` → `check_host_key()`
+→ `get_hostfile_hostname_ipaddr()`.  The interactive prompt that most users
+accept without thought is the sole defence at this point.
+
+#### 2. `StrictHostKeyChecking no` — MITM on every connection
+
+```
+# In ~/.ssh/config or /etc/ssh/ssh_config:
+Host *
+    StrictHostKeyChecking no
+```
+
+With this setting the client silently accepts any host key — including one
+substituted by an attacker — on every connection, not just the first.  This
+configuration is extremely common in CI/CD pipelines, Docker images, and
+automation scripts where the convenience of non-interactive operation is
+prioritised over security.
+
+`StrictHostKeyChecking accept-new` is a slightly safer variant: it accepts
+new keys silently but refuses to connect if a *stored* key changes.  It
+still leaves the first-connection window open.
+
+#### 3. `UserKnownHostsFile /dev/null`
+
+```
+ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no user@host
+```
+
+Discards all learned host keys.  Every connection behaves as a first
+connection; the TOFU window is permanently open.  Common in throwaway
+containers and test environments.
+
+#### 4. DNS or ARP spoofing before the first connection
+
+If an attacker controls the DNS resolution or ARP responses that route the
+client's first TCP connection, they can direct the client to their own server,
+serve their own host key, and have it stored legitimately in `known_hosts`.
+All subsequent connections to that hostname (via the spoofed key) are then
+silently proxied.
+
+#### 5. Host key compromise
+
+If an attacker obtains the server's private host key (from
+`/etc/ssh/ssh_host_*_key`) they can impersonate the server to any client that
+has already stored the corresponding public key.  File permissions on these
+keys are `0600` root-only, but they are copied into VM images, leaked in
+container layers, or backed up insecurely with some regularity.
+
+### Mitigations
+
+#### Mitigation 1: Verify fingerprints out-of-band (eliminates TOFU)
+
+Before accepting a new host key, compare the displayed fingerprint to one
+obtained through a channel the attacker cannot influence — for example, the
+cloud provider's serial console, an IPMI interface, or a configuration
+management system that provisioned the server:
+
+```bash
+# On the server — display its fingerprints
+ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
+ssh-keygen -lf /etc/ssh/ssh_host_rsa_key.pub
+
+# On the client — verify the fingerprint shown by ssh matches
+```
+
+This is operationally awkward at scale but is the baseline defence.
+
+#### Mitigation 2: Pre-populate `known_hosts` at provisioning time
+
+Inject the correct host public key into `~/.ssh/known_hosts` (or the system
+`/etc/ssh/ssh_known_hosts`) before the first user connection, using a trusted
+out-of-band channel such as cloud-init, Ansible, or Terraform:
+
+```bash
+# Collect the host key directly from the server at provisioning time
+# (only safe if done over a trusted channel or extracted from a signed image)
+ssh-keyscan -t ed25519 example.com >> ~/.ssh/known_hosts
+
+# Or copy directly from the server filesystem:
+ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub   # verify fingerprint first
+cat /etc/ssh/ssh_host_ed25519_key.pub | \
+    ssh-keygen -H -f /dev/stdin >> ~/.ssh/known_hosts
+```
+
+Note that `ssh-keyscan` over an untrusted network has the same TOFU problem
+as an interactive connection — it must be run over a channel the attacker
+cannot reach.
+
+#### Mitigation 3: SSHFP DNS records with DNSSEC
+
+SSHFP (RFC 4255) allows host key fingerprints to be published in DNS and
+automatically validated by the SSH client.  **DNSSEC is required** — without
+it an attacker who can spoof DNS can also spoof SSHFP records.
+
+```bash
+# On the server — generate SSHFP records to add to your zone
+ssh-keygen -r example.com -f /etc/ssh/ssh_host_ed25519_key.pub
+# Output: example.com IN SSHFP 4 1 <sha1>
+#         example.com IN SSHFP 4 2 <sha256>
+
+# Add to DNS zone file, sign with DNSSEC (zone must be DNSSEC-signed)
+```
+
+```
+# In sshd_config / ssh_config — enable client-side SSHFP verification
+VerifyHostKeyDNS yes
+```
+
+With this configuration and a DNSSEC-signed zone, the client automatically
+validates the host key against DNS before prompting — eliminating the TOFU
+window for any host with an SSHFP record.
+
+#### Mitigation 4: SSH host certificates (strongest — eliminates TOFU entirely)
+
+OpenSSH supports CA-signed host certificates.  The server presents a
+certificate signed by a trusted CA; the client trusts the CA rather than
+individual host keys.  This eliminates the TOFU window, enables instant
+key rotation, and allows certificate revocation.
+
+```bash
+# Step 1 — Create a CA (done once, CA private key kept offline)
+ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ca -C "Host CA"
+
+# Step 2 — Sign each server's host key with the CA
+ssh-keygen -s /etc/ssh/ssh_host_ca \
+    -I "example.com host key" \
+    -h \                               # -h = host certificate (not user)
+    -n "example.com,203.0.113.5" \     # valid hostnames / IPs
+    -V +52w \                          # valid for 1 year
+    /etc/ssh/ssh_host_ed25519_key.pub
+# Produces: /etc/ssh/ssh_host_ed25519_key-cert.pub
+```
+
+```
+# sshd_config — present the certificate
+HostCertificate /etc/ssh/ssh_host_ed25519_key-cert.pub
+```
+
+```
+# ~/.ssh/known_hosts — trust the CA for the entire domain
+@cert-authority *.example.com ssh-ed25519 AAAA...  (CA public key)
+```
+
+Any server presenting a valid CA-signed certificate for the connecting
+hostname is trusted **without a TOFU prompt**.  Rotating host keys no longer
+breaks clients; a compromised key is remediated by issuing a new certificate
+and revoking the old one via a `RevokedKeys` file or KRL.
+
+#### Mitigation 5: Never use `StrictHostKeyChecking no` in production
+
+| Setting | Behaviour | Safe? |
+|---------|-----------|-------|
+| `StrictHostKeyChecking yes` | Refuses any unknown or changed key | **Yes** — use with pre-populated known_hosts |
+| `StrictHostKeyChecking accept-new` | Silently accepts new keys; refuses changed keys | Partially — first connection still unprotected |
+| `StrictHostKeyChecking no` | Silently accepts all keys, including changed ones | **No** |
+| `UserKnownHostsFile /dev/null` | Discards all host keys | **No** |
+
+### Attack surface summary
+
+| Scenario | Vulnerable? | Mitigation |
+|----------|-------------|------------|
+| First connection to any new host | **Yes** (TOFU) | Out-of-band fingerprint verification; host certificates; SSHFP+DNSSEC |
+| Established connection (host key already verified) | **No** | Protocol is cryptographically sound post-verification |
+| `StrictHostKeyChecking no` configured | **Yes, always** | Remove this setting; use `yes` or `accept-new` |
+| `UserKnownHostsFile /dev/null` | **Yes, always** | Remove this setting |
+| DNS or ARP spoofing before first connection | **Yes** | SSHFP+DNSSEC; host certificates; out-of-band fingerprint check |
+| Server host key compromised | **Yes** | Protect `/etc/ssh/ssh_host_*_key` (0600 root); use short-lived CA-signed certificates |
+| Client `known_hosts` tampered | **Yes** | Protect `~/.ssh/known_hosts`; use system-wide `/etc/ssh/ssh_known_hosts` |
+
+### Relationship to findings in this document
+
+Finding **#15** (`kex.c:746` — no length cap on `server-sig-algs`) is the
+closest code-level finding to a MITM concern: a malicious server can induce
+O(n·m) algorithm-matching work on the client.  However it requires the
+client to have already connected to a malicious server — i.e. MITM has
+already succeeded at the host verification step.
+
+Finding **#13** (`kex.c:1622` — log injection via version banner) is
+reachable before key exchange and can be used to obscure MITM indicators
+from administrators monitoring logs.
+
+All other findings in this document are either post-authentication or
+internal to a correctly established session; they do not directly enable
+MITM and are not affected by whether host key verification is configured
+correctly.

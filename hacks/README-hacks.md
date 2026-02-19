@@ -9,9 +9,9 @@ real and to validate that fixes resolve them.
 - PoC #1–#4 (`sshd-socket-generator` / `sshd.c` findings) were fixed on the
   `security-flaw-fixes` branch, which has since been merged into `master`.
   Running these PoCs on the current `master` will show the *fixed* behaviour.
-- PoC #5–#7 (`auth2.c` findings) and PoC #9–#13 (`packet.c` findings) remain
-  unfixed on `master`; the C reproducers confirm the behaviour regardless of
-  branch.
+- PoC #5–#7 (`auth2.c` findings), PoC #9–#13 (`packet.c` findings), and
+  PoC #14–#18 (`umac.c` findings) remain unfixed on `master`; the C
+  reproducers confirm the behaviour regardless of branch.
 - PoC #8 (zip bomb, `packet.c` finding #17) has been **fixed directly on
   `master`** — running it on the current tree will show the cap enforced.
 
@@ -450,6 +450,7 @@ python3 hacks/poc12_static_disconnecting.py
 
 ## PoC #13 — `kex_from_blob()` Hardcodes `kex->server = 1` (INFO)
 
+
 **File:** `poc13_kex_server_flag.py`
 **Finding:** #18 — `packet.c:2436`
 **Target:** Source scan + C reproducer compiled at runtime
@@ -471,6 +472,142 @@ python3 hacks/poc12_static_disconnecting.py
 
 ```bash
 python3 hacks/poc13_kex_server_flag.py
+```
+
+---
+
+---
+
+## PoC #14 — UMAC 16 MB Message Limit Not Enforced at Runtime (LOW)
+
+**File:** `poc14_umac_16mb_limit.py`
+**Finding:** #22 — `umac.c:827-848`
+**Target:** C reproducer compiled at runtime
+**Privilege required:** None
+
+### What it does
+
+Mirrors the `poly64()` and `poly_hash()` functions from `umac.c` and
+demonstrates that calling `poly_hash()` more than 2^14 times (the
+documented 16 MB limit) produces no error, warning, or changed return
+status.  The polynomial accumulator silently diverges from what a correct
+RFC 4418 (p128-ramped) implementation would produce.
+
+Also shows the SSH safety margin: `PACKET_MAX_SIZE` (~256 KB) limits each
+UMAC session to at most 256 `poly_hash()` invocations — well under the
+16,384-call limit.
+
+### Run
+
+```bash
+python3 hacks/poc14_umac_16mb_limit.py
+```
+
+---
+
+## PoC #15 — Signed Integer Overflow in `nh_final()` — `bytes_hashed << 3` (INFO)
+
+**File:** `poc15_nh_final_shift_ub.py`
+**Finding:** #23 — `umac.c:692`
+**Target:** C reproducer compiled at runtime
+**Privilege required:** None
+
+### What it does
+
+Evaluates `(int bytes_hashed) << 3` (the expression at `umac.c:692`) for
+a range of `bytes_hashed` values from 1024 through 2^30.  Identifies 2^28
+(256 MB) as the overflow threshold (C11 §6.5.7p4 UB), shows the observed
+bit-pattern results on this platform, and contrasts with the `UINT32 nbits`
+version used in the companion function `nh()` at `umac.c:718`.
+
+Also attempts a UBSAN recompile to confirm runtime detection.
+
+### Run
+
+```bash
+python3 hacks/poc15_nh_final_shift_ub.py
+```
+
+---
+
+## PoC #16 — `kdf()` Counter Byte Truncation at 256 AES Blocks (INFO)
+
+**File:** `poc16_kdf_counter_wrap.py`
+**Finding:** #24 — `umac.c:199`
+**Target:** C reproducer compiled at runtime
+**Privilege required:** None
+
+### What it does
+
+Mirrors the `kdf()` counter loop from `umac.c:185-209` and generates 260
+AES counter blocks.  Shows that block 257 uses the same counter byte (0x01)
+as block 1 — because the `int i` counter wraps from 256 to 0 when stored
+in a `UINT8` slot — causing the keystream to repeat from block 257 onward.
+Verifies that the keystream bytes at blocks 1 and 257 are identical.
+
+Also confirms the in-practice safety margin: max UMAC key derivation is
+~103 AES blocks, well under the 256-block wrap threshold.
+
+### Run
+
+```bash
+python3 hacks/poc16_kdf_counter_wrap.py
+```
+
+---
+
+## PoC #17 — Strict-Aliasing UB via `UINT8*` → `UINT64*`/`UINT32*` Casts (INFO)
+
+**File:** `poc17_umac_aliasing_ub.py`
+**Finding:** #25 — `umac.c` (pervasive)
+**Target:** C reproducer + source scan compiled at runtime
+**Privilege required:** None
+
+### What it does
+
+Reproduces the raw-pointer-cast pattern found throughout `umac.c` (e.g.
+`*((UINT64 *)hp)` in `nh_aux()`, `((UINT64 *)result)[0]` in `nh_final()`,
+`((UINT32 *)nonce)[1]` in `pdf_gen_xor()`).  Compiles with
+`-Wstrict-aliasing=2` to surface compiler warnings, with
+`-fsanitize=undefined` for runtime detection, and at `-O3` to approach
+the regime where the GCC note at `umac.c:44` ("incorrect results sometimes
+produced under -O3") is relevant.
+
+Also scans the actual `umac.c` source to count and list all
+`UINT8*` → `UINT64*`/`UINT32*` cast sites.
+
+### Run
+
+```bash
+python3 hacks/poc17_umac_aliasing_ub.py
+```
+
+---
+
+## PoC #18 — `long len` Silently Truncated to `UINT32` at `nh_update()` (INFO)
+
+**File:** `poc18_len_truncation.py`
+**Finding:** #26 — `umac.c:1044/613`
+**Target:** C reproducer compiled at runtime
+**Privilege required:** None
+
+### What it does
+
+Shows the implicit `long` → `UINT32` conversion at the `nh_update()` call
+boundary and the `UINT32 msg_len` accumulator wrap in `uhash_update()`.
+For inputs exceeding 4 GB, demonstrates:
+1. `nh_update()` receives a truncated byte count — processing far less data
+   than requested, silently.
+2. `msg_len` wraps at UINT32_MAX, potentially flipping the short-message
+   (`ip_short`) vs long-message (`ip_long`) dispatch in `uhash_final()`.
+
+Confirms that both are unreachable in SSH (PACKET_MAX_SIZE = 256 KB) and
+shows the 16,000× safety margin.
+
+### Run
+
+```bash
+python3 hacks/poc18_len_truncation.py
 ```
 
 ---
@@ -502,6 +639,13 @@ python3 hacks/poc10_shift_ub.py
 python3 hacks/poc11_newkeys_keylen.py
 python3 hacks/poc12_static_disconnecting.py
 python3 hacks/poc13_kex_server_flag.py
+
+# PoC #14–#18: unfixed (umac.c findings — all unreachable within SSH limits)
+python3 hacks/poc14_umac_16mb_limit.py
+python3 hacks/poc15_nh_final_shift_ub.py
+python3 hacks/poc16_kdf_counter_wrap.py
+python3 hacks/poc17_umac_aliasing_ub.py
+python3 hacks/poc18_len_truncation.py
 ```
 
 ---
@@ -596,6 +740,11 @@ The TOCTOU fix on branch `security-flaw-fixes` (using
 | #11 | newkeys keylen | **No** | Requires tampering with the privsep state blob |
 | #12 | static disconnecting | **No** | Process-internal state; not reachable from the network |
 | #13 | kex server flag | **No** | Privsep deserialization path, not driven by network packets |
+| #14 | UMAC 16 MB limit | **No** | Each SSH packet is ≤ 256 KB; 16 MB threshold never reached |
+| #15 | nh_final shift UB | **No** | bytes_hashed reset at 1024 bytes; 256 MB threshold unreachable |
+| #16 | kdf counter wrap | **No** | Max 103 AES blocks per key derivation; 256-block wrap unreachable |
+| #17 | Strict-aliasing UB | **No** | Compiler/platform-internal; not driven by network input |
+| #18 | long→UINT32 trunc | **No** | len bounded by PACKET_MAX_SIZE (256 KB) << UINT32_MAX (4 GB) |
 
 **PoC #1–#4** target `sshd-socket-generator`, a systemd boot-time utility
 that runs once at startup and is never network-facing.  PoC #2 touches
@@ -611,6 +760,11 @@ findings in this review.
 legacy `COMP_ZLIB` this is possible immediately after key exchange without
 authenticating; with the default `zlib@openssh.com` (`COMP_DELAYED`)
 authentication must succeed first.  **This finding has been fixed on master.**
+
+**PoC #14–#18** (`umac.c` findings) are not remotely reachable.  All five
+issues require inputs that exceed the SSH packet-size or key-derivation
+limits by many orders of magnitude.  They are included for completeness and
+as defence-in-depth documentation.
 
 ---
 
