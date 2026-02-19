@@ -779,6 +779,7 @@ uncompress_buffer(struct ssh *ssh, struct sshbuf *in, struct sshbuf *out)
 {
 	u_char buf[4096];
 	int r, status;
+	size_t chunk, out_total = 0;
 
 	if (ssh->state->compression_in_started != 1)
 		return SSH_ERR_INTERNAL_ERROR;
@@ -797,8 +798,20 @@ uncompress_buffer(struct ssh *ssh, struct sshbuf *in, struct sshbuf *out)
 		    Z_SYNC_FLUSH);
 		switch (status) {
 		case Z_OK:
-			if ((r = sshbuf_put(out, buf, sizeof(buf) -
-			    ssh->state->compression_in_stream.avail_out)) != 0)
+			chunk = sizeof(buf) -
+			    ssh->state->compression_in_stream.avail_out;
+			out_total += chunk;
+			/*
+			 * Limit decompressed output to PACKET_MAX_SIZE to
+			 * prevent a zip-bomb: a maximally-compressed packet
+			 * (up to PACKET_MAX_SIZE bytes of ciphertext) could
+			 * otherwise expand to gigabytes of plaintext.
+			 */
+			if (out_total > PACKET_MAX_SIZE) {
+				ssh->state->compression_in_failures++;
+				return SSH_ERR_INVALID_FORMAT;
+			}
+			if ((r = sshbuf_put(out, buf, chunk)) != 0)
 				return r;
 			break;
 		case Z_BUF_ERROR:
