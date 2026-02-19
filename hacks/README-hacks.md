@@ -302,6 +302,43 @@ truncation.  The TOCTOU fix on branch `security-flaw-fixes` (using
 
 ---
 
+## Remote Exploitability (Port 22)
+
+### Can any of these flaws be triggered by a remote attacker connecting to port 22?
+
+**No.** None of these vulnerabilities are remotely exploitable via SSH.
+
+**All four PoCs target `sshd-socket-generator`**, which is a systemd
+boot-time utility.  It runs once at startup to configure socket units and
+then exits.  It is never network-facing, never listens on port 22, and
+cannot be reached by an incoming SSH connection under any circumstances.
+
+**PoC #2 touches `sshd.c`** (`get_systemd_listen_fds`), but:
+- It only fires if `$LISTEN_FDS` or `$LISTEN_PID` are set to malformed
+  values in sshd's environment before it starts.
+- Those variables are set by systemd at exec time, not by network clients.
+- An SSH client connecting to port 22 has no mechanism to influence the
+  environment of an already-running sshd process.
+- By the time sshd is accepting connections, this code path has already
+  completed and cannot be re-triggered.
+
+**To exploit any of these vulnerabilities remotely you would need:**
+- The ability to control systemd environment variables before sshd starts
+  (requires local access or existing root), or
+- The ability to invoke `sshd-socket-generator` with crafted arguments
+  (requires a local shell).
+
+**What would be dangerous remotely** are vulnerabilities in the SSH
+protocol handling code itself — pre-authentication parsing in `sshd.c`,
+key exchange in `kex.c`, or authentication in `auth2.c`.  None of the
+flaws found in this review are in those code paths.
+
+**Summary:** These are strictly **local** vulnerabilities.  An attacker
+with only port 22 access and no existing foothold on the system cannot
+trigger any of them.
+
+---
+
 ## Disclaimer
 
 These scripts are provided solely for security research and defensive
