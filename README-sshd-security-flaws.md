@@ -1106,7 +1106,7 @@ window for any host with an SSHFP record.
 
 #### Mitigation 4: SSH host certificates (strongest — eliminates TOFU entirely)
 
-> **Full implementation guide: [`README-cert.md`](README-cert.md)**
+> **Full implementation guide: [`ca/README-cert.md`](ca/README-cert.md)**
 > CA management scripts are in the [`ca/`](ca/) directory.
 
 
