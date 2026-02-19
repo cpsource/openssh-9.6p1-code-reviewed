@@ -1051,7 +1051,7 @@ get_systemd_listen_fds(void)
 	                return 0;
 	        listen_pid = (pid_t)strtonum(listen_pid_str, 2, INT_MAX, &errstr);
 	        if (errstr != NULL)
-	                return -errno;
+	                return -EINVAL;
 	        if (getpid() != listen_pid)
 	                return 0;
 	}
@@ -1062,7 +1062,7 @@ get_systemd_listen_fds(void)
 	listen_fds = (int)strtonum(listen_fds_str, 1,
 	    INT_MAX - SYSTEMD_LISTEN_FDS_START, &errstr);
 	if (errstr != NULL)
-		return -errno;
+		return -EINVAL;
 
 	return listen_fds;
 }
