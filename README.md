@@ -4,21 +4,18 @@ README-sshd-security-flaws.md for details on all identified issues.
 
 Recent commit history (newest first):
 
-  Commit   Description
-  -------- -----------------------------------------------------------------
-  2464f17  Update cross-reference link to ca/README-cert.md
-  bca2727  Move README-cert.md into ca/ directory
-  dd86598  Add Host CA infrastructure and cert setup guide
-  c1cc50b  umac.c findings #22-#26, PoC scripts poc14-poc18, MITM analysis
-  4e1c30a  Update README-hacks.md for poc5-poc13
-  7341238  PoC scripts for packet.c findings #16-21
-  e4720f6  Fix: cap decompressed output (zip bomb fix)
-  f87ca60  PoC scripts for auth2.c findings #9-11
-  09fdce5  kex.c findings #12-15
-  2ad6822  auth2.c findings #9-11
-  b0fede6  Merge of security-flaw-fixes branch
-  (older)  Security fixes, PoCs, hacks/, build fixes, initial release
-  -------- -----------------------------------------------------------------
+- `2464f17` Update cross-reference link to ca/README-cert.md
+- `bca2727` Move README-cert.md into ca/ directory
+- `dd86598` Add Host CA infrastructure and cert setup guide
+- `c1cc50b` umac.c findings #22-#26, PoC scripts poc14-poc18, MITM analysis
+- `4e1c30a` Update README-hacks.md for poc5-poc13
+- `7341238` PoC scripts for packet.c findings #16-21
+- `e4720f6` Fix: cap decompressed output (zip bomb fix)
+- `f87ca60` PoC scripts for auth2.c findings #9-11
+- `09fdce5` kex.c findings #12-15
+- `2ad6822` auth2.c findings #9-11
+- `b0fede6` Merge of security-flaw-fixes branch
+- `(older)` Security fixes, PoCs, hacks/, build fixes, initial release
 
 -------------------------------------------------------------------------------
 
